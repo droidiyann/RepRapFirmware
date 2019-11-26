@@ -23,9 +23,10 @@
 // so that each one gets an interval while the other one is being polled.
 
 constexpr float MaximumMotorCurrent = 1600.0;
-constexpr uint32_t DefaultMicrosteppingShift = 4;						// x16 microstepping
-constexpr bool DefaultInterpolation = true;								// interpolation enabled
-constexpr uint32_t DefaultTpwmthrsReg = 2000;							// low values (high changeover speed) give horrible jerk at the changeover from stealthChop to spreadCycle
+constexpr float MinimumOpenLoadMotorCurrent = 500;			// minimum current in mA for the open load status to be taken seriously
+constexpr uint32_t DefaultMicrosteppingShift = 4;			// x16 microstepping
+constexpr bool DefaultInterpolation = true;					// interpolation enabled
+constexpr uint32_t DefaultTpwmthrsReg = 2000;				// low values (high changeover speed) give horrible jerk at the changeover from stealthChop to spreadCycle
 
 static size_t numTmc22xxDrivers;
 
@@ -279,6 +280,7 @@ private:
 	void UpdateRegister(size_t regIndex, uint32_t regVal);
 	void UpdateChopConfRegister();							// calculate the chopper control register and flag it for sending
 	void UpdateCurrent();
+	void UpdateMaxOpenLoadStepInterval();
 
 #if TMC22xx_HAS_MUX
 	void SetUartMux();
@@ -300,12 +302,14 @@ private:
 	static constexpr unsigned int WritePwmConf = 4;			// read register select, sense voltage high/low sensitivity
 	static constexpr unsigned int WriteTpwmthrs = 5;		// upper step rate limit for stealthchop
 
-	static constexpr unsigned int NumReadRegisters = 2;		// the number of registers that we read from
+	static constexpr unsigned int NumReadRegisters = 4;		// the number of registers that we read from
 	static const uint8_t ReadRegNumbers[NumReadRegisters];	// the register numbers that we read from
 
 	// Read register numbers, in same order as ReadRegNumbers
 	static constexpr unsigned int ReadGStat = 0;
 	static constexpr unsigned int ReadDrvStat = 1;
+	static constexpr unsigned int ReadMsCnt = 2;
+	static constexpr unsigned int ReadPwmScale = 3;
 
 	volatile uint32_t writeRegisters[NumWriteRegisters];	// the values we want the TMC22xx writable registers to have
 	volatile uint32_t readRegisters[NumReadRegisters];		// the last values read from the TMC22xx readable registers
@@ -318,6 +322,7 @@ private:
 	uint32_t axisNumber;									// the axis number of this driver as used to index the DriveMovements in the DDA
 	uint32_t microstepShiftFactor;							// how much we need to shift 1 left by to get the current microstepping
 	uint32_t motorCurrent;									// the configured motor current
+	uint32_t maxOpenLoadStepInterval;						// the maximum step pulse interval for which we consider open load detection to be reliable
 
 #if TMC22xx_HAS_MUX
 	static Uart * const uart;								// the UART that controls all drivers
@@ -385,13 +390,17 @@ const uint8_t TmcDriverState::WriteRegNumbers[NumWriteRegisters] =
 const uint8_t TmcDriverState::ReadRegNumbers[NumReadRegisters] =
 {
 	REGNUM_GSTAT,
-	REGNUM_DRV_STATUS
+	REGNUM_DRV_STATUS,
+	REGNUM_MSCNT,
+	REGNUM_PWM_SCALE
 };
 
 const uint8_t TmcDriverState::ReadRegCRCs[NumReadRegisters] =
 {
 	CRCAddByte(InitialSendCRC, ReadRegNumbers[0]),
-	CRCAddByte(InitialSendCRC, ReadRegNumbers[1])
+	CRCAddByte(InitialSendCRC, ReadRegNumbers[1]),
+	CRCAddByte(InitialSendCRC, ReadRegNumbers[2]),
+	CRCAddByte(InitialSendCRC, ReadRegNumbers[3])
 };
 
 // State structures for all drivers
@@ -439,6 +448,27 @@ inline void TmcDriverState::SetupDMAReceive(uint8_t regNum, uint8_t crc)
 	pdc->PERIPH_PTCR = (PERIPH_PTCR_RXTEN | PERIPH_PTCR_TXTEN);		// enable the PDC to transmit and receive
 }
 
+// Update the maximum step pulse interval at wich we consider open load detection to be reliable
+void TmcDriverState::UpdateMaxOpenLoadStepInterval()
+{
+	const uint32_t defaultMaxInterval = StepTimer::StepClockRate/MinimumOpenLoadFullStepsPerSec;
+	if ((writeRegisters[WriteGConf] & GCONF_SPREAD_CYCLE) != 0)
+	{
+		maxOpenLoadStepInterval = defaultMaxInterval;
+	}
+	else
+	{
+		// In stealthchop mode open load detection in unreliable, so disable it below the speed at which we switch to spreadCycle
+		const uint32_t tpwmthrs = writeRegisters[WriteTpwmthrs] & 0x000FFFFF;
+		// tpwmthrs is the 20-bit interval between 1/256 microsteps threshold, in clock cycles @ 12MHz.
+		// We need to convert it to the interval between full steps, measured in our step clocks, less about 20% to allow some margin.
+		// So multiply by the step clock rate divided by 12MHz, also multiply by 256 less 20%.
+		constexpr uint32_t conversionFactor = ((256 - 51) * (StepTimer::StepClockRate/1000000))/12;
+		const uint32_t fullStepClocks = tpwmthrs * conversionFactor;
+		maxOpenLoadStepInterval = min<uint32_t>(fullStepClocks, defaultMaxInterval);
+	}
+}
+
 // Set a register value and flag it for updating
 void TmcDriverState::UpdateRegister(size_t regIndex, uint32_t regVal)
 {
@@ -454,6 +484,10 @@ void TmcDriverState::UpdateRegister(size_t regIndex, uint32_t regVal)
 	writeRegCRCs[regIndex] = crc;
 	registersToUpdate |= (1u << regIndex);								// flag it for sending
 	cpu_irq_restore(flags);
+	if (regIndex == WriteGConf || regIndex == WriteTpwmthrs)
+	{
+		UpdateMaxOpenLoadStepInterval();
+	}
 }
 
 // Calculate the chopper control register and flag it for sending
@@ -592,7 +626,13 @@ uint32_t TmcDriverState::GetRegister(SmartDriverRegister reg) const
 		return (configuredChopConfReg & CHOPCONF_HEND_MASK) >> CHOPCONF_HEND_SHIFT;
 
 	case SmartDriverRegister::tpwmthrs:
-		return writeRegisters[WriteTpwmthrs];
+		return writeRegisters[WriteTpwmthrs] & 0x000FFFFF;
+
+	case SmartDriverRegister::mstepPos:
+		return readRegisters[ReadMsCnt];
+
+	case SmartDriverRegister::pwmScale:
+		return readRegisters[ReadPwmScale];
 
 	case SmartDriverRegister::hdec:
 	case SmartDriverRegister::coolStep:
@@ -760,9 +800,10 @@ inline void TmcDriverState::TransferDone()
 			if (registerToRead == ReadDrvStat)
 			{
 				uint32_t interval;
-				if ((regVal & TMC_RR_STST) != 0
+				if (   (regVal & TMC_RR_STST) != 0
 					|| (interval = reprap.GetMove().GetStepInterval(axisNumber, microstepShiftFactor)) == 0		// get the full step interval
-					|| interval > StepTimer::StepClockRate/MinimumOpenLoadFullStepsPerSec
+					|| interval > maxOpenLoadStepInterval
+					|| motorCurrent < MinimumOpenLoadMotorCurrent
 				   )
 				{
 					regVal &= ~(TMC_RR_OLA | TMC_RR_OLB);				// open load bits are unreliable at standstill and low speeds
@@ -851,22 +892,12 @@ inline void TmcDriverState::StartTransfer()
 	}
 	else
 	{
-		// Write a register
-		size_t regNum = 0;
-		uint32_t mask = 1;
-		do
-		{
-			if ((registersToUpdate & mask) != 0)
-			{
-				break;
-			}
-			++regNum;
-			mask <<= 1;
-		} while (regNum < NumWriteRegisters - 1);
+		// Pick a register to write
+		const size_t regNum = LowestSetBitNumber(registersToUpdate);
 
 		// Kick off a transfer for that register
 		const irqflags_t flags = cpu_irq_save();		// avoid race condition
-		registerBeingUpdated = mask;
+		registerBeingUpdated = 1u << regNum;
 		uart->UART_CR = UART_CR_RSTRX | UART_CR_RSTTX;	// reset transmitter and receiver
 		SetupDMASend(WriteRegNumbers[regNum], writeRegisters[regNum], writeRegCRCs[regNum]);	// set up the PDC
 		uart->UART_IER = UART_IER_ENDRX;				// enable end-of-transfer interrupt

@@ -224,7 +224,7 @@ bool FileInfoParser::GetFileInfo(const char *filePath, GCodeFileInfo& info, bool
 				const uint32_t startTime = millis();
 				if (!fileBeingParsed->Seek(thisSeekPos))
 				{
-					reprap.GetPlatform().Message(ErrorMessage, "Could not seek from end of file!\n");
+					reprap.GetPlatform().MessageF(ErrorMessage, "Could not seek from end of file \"%s\"\n", filePath);
 					parseState = notParsing;
 					fileBeingParsed->Close();
 					info = parsedFileInfo;
@@ -648,7 +648,7 @@ unsigned int FileInfoParser::FindFilamentUsed(const char* buf, size_t len)
 	while (filamentsFound < maxFilaments &&	(p = strstr(p, filamentUsedStr1)) != nullptr)
 	{
 		p += strlen(filamentUsedStr1);
-		while(strchr(" :=\t", *p) != nullptr)
+		while(strchr(" [m]:=\t", *p) != nullptr)					// Prusa slicer now uses "; filament used [mm] = 4235.9"
 		{
 			++p;	// this allows for " = " from default slic3r comment and ": " from default Cura comment
 		}
@@ -728,6 +728,10 @@ unsigned int FileInfoParser::FindFilamentUsed(const char* buf, size_t len)
 		while (filamentsFound < maxFilaments && (p = strstr(p, filamentLengthStr)) != nullptr)
 		{
 			p += strlen(filamentLengthStr);
+			if (*p == '#')
+			{
+				++p;				// later KISSlicer versions add a # here
+			}
 			while(isdigit(*p))
 			{
 				++p;
@@ -769,8 +773,9 @@ bool FileInfoParser::FindPrintTime(const char* buf, size_t len)
 		" estimated printing time (normal mode)",	// slic3r PE later versions	"; estimated printing time (normal mode) = 1h 5m 24s"
 		" estimated printing time",					// slic3r PE older versions	"; estimated printing time = 1h 5m 24s"
 		";TIME",									// Cura						";TIME:38846"
-		" Build time"								// S3D						";   Build time: 0 hours 42 minutes"
-													// also KISSlicer			"; Estimated Build Time:   332.83 minutes"
+		" Build time",								// S3D						";   Build time: 0 hours 42 minutes"
+		" Build Time"								// KISSlicer				"; Estimated Build Time:   332.83 minutes"
+													// also KISSSlicer 2 alpha	"; Calculated-during-export Build Time: 130.62 minutes"
 	};
 
 	for (const char * ptStr : PrintTimeStrings)

@@ -29,7 +29,7 @@ Licence: GPL
 // Platform-specific includes
 
 #include "RepRapFirmware.h"
-#include "IoPorts.h"
+#include "Hardware/IoPorts.h"
 #include "DueFlashStorage.h"
 #include "Fans/Fan.h"
 #include "Fans/Tacho.h"
@@ -382,12 +382,12 @@ public:
 	const char* GetConfigFile() const; 				// Where the configuration is stored (in the system dir).
 	const char* GetDefaultFile() const;				// Where the default configuration is stored (in the system dir).
 
-	// Function to work with the system files folder
-	void SetSysDir(const char* dir);				// Set the system files path
+	// Functions to work with the system files folder
+	GCodeResult SetSysDir(const char* dir, const StringRef& reply);				// Set the system files path
 	bool SysFileExists(const char *filename) const;
 	FileStore* OpenSysFile(const char *filename, OpenMode mode) const;
 	bool DeleteSysFile(const char *filename) const;
-	void MakeSysFileName(const StringRef& result, const char *filename) const;
+	bool MakeSysFileName(const StringRef& result, const char *filename) const;
 	void GetSysDir(const StringRef & path) const;
 
 	// Message output (see MessageType for further details)
@@ -610,7 +610,6 @@ public:
 	float GetLaserPwmFrequency() const { return laserPort.GetFrequency(); }
 
 	// Misc
-	void InitI2c();
 
 #if SAM4E || SAM4S || SAME70
 	uint32_t Random();
@@ -936,7 +935,6 @@ private:
 
 	// Misc
 	bool deliberateError;								// true if we deliberately caused an exception for testing purposes
-	bool i2cInitialised;								// true if the I2C subsystem has been initialised
 };
 
 // Where the htm etc files are
@@ -997,7 +995,7 @@ inline float Platform::MaxFeedrate(size_t drive) const
 
 inline void Platform::SetMaxFeedrate(size_t drive, float value)
 {
-	maxFeedrates[drive] = max<float>(value, 1.0);		// don't allow zero or negative
+	maxFeedrates[drive] = max<float>(value, minimumMovementSpeed);	// don't allow zero or negative, but do allow small values
 }
 
 inline float Platform::GetInstantDv(size_t drive) const

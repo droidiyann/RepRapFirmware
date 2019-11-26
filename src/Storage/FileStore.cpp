@@ -56,7 +56,7 @@ bool FileStore::IsOpenOn(const FATFS *fs) const
 // This is protected - only Platform can access it.
 bool FileStore::Open(const char* filePath, OpenMode mode, uint32_t preAllocSize)
 {
-	const bool writing = (mode == OpenMode::write || mode == OpenMode::append);
+	const bool writing = (mode == OpenMode::write || mode == OpenMode::writeWithCrc || mode == OpenMode::append);
 	writeBuffer = nullptr;
 
 	if (writing)
@@ -90,14 +90,14 @@ bool FileStore::Open(const char* filePath, OpenMode mode, uint32_t preAllocSize)
 		// We only do this if the mode is write, not append, because we don't want to use up a large buffer to append messages to the log file,
 		// especially as we need to flush messages to SD card regularly.
 		// Currently, append mode is used for the log file and for appending simulated print times to GCodes files (which required read access too).
-		if (mode == OpenMode::write)
+		if (mode == OpenMode::write || mode == OpenMode::writeWithCrc)
 		{
 			writeBuffer = reprap.GetPlatform().GetMassStorage()->AllocateWriteBuffer();
 		}
 	}
 
 	const FRESULT openReturn = f_open(&file, filePath,
-										(mode == OpenMode::write) ?  FA_CREATE_ALWAYS | FA_WRITE
+										(mode == OpenMode::write || mode == OpenMode::writeWithCrc) ?  FA_CREATE_ALWAYS | FA_WRITE
 											: (mode == OpenMode::append) ? FA_READ | FA_WRITE | FA_OPEN_ALWAYS
 												: FA_OPEN_EXISTING | FA_READ);
 	if (openReturn != FR_OK)
@@ -118,9 +118,10 @@ bool FileStore::Open(const char* filePath, OpenMode mode, uint32_t preAllocSize)
 	}
 
 	crc.Reset();
+	calcCrc = (mode == OpenMode::writeWithCrc);
 	usageMode = (writing) ? FileUseMode::readWrite : FileUseMode::readOnly;
 	openCount = 1;
-	if (mode == OpenMode::write && preAllocSize != 0)
+	if (preAllocSize != 0 && (mode == OpenMode::write || mode == OpenMode::writeWithCrc))
 	{
 		const FRESULT expandReturn = f_expand(&file, preAllocSize, 1);		// try to pre-allocate contiguous space - it doesn't matter if it fails
 		if (reprap.Debug(moduleStorage))
@@ -305,7 +306,7 @@ int FileStore::Read(char* extBuf, size_t nBytes)
 			FRESULT readStatus = f_read(&file, extBuf, nBytes, &bytes_read);
 			if (readStatus != FR_OK)
 			{
-				reprap.GetPlatform().MessageF(ErrorMessage, "Cannot read file, error code %d.\n", (int)readStatus);
+				reprap.GetPlatform().MessageF(ErrorMessage, "Cannot read file, error code %d\n", (int)readStatus);
 				return -1;
 			}
 			return (int)bytes_read;
@@ -319,13 +320,14 @@ int FileStore::Read(char* extBuf, size_t nBytes)
 
 // As Read but stop after '\n' or '\r\n' and null-terminate the string.
 // If the next line is too long to fit in the buffer then the line will be split.
+// Return the number of characters in the line excluding the null terminator, or -1 if end of file or a read error occurs.
 int FileStore::ReadLine(char* buf, size_t nBytes)
 {
 	const FilePosition lineStart = Position();
 	const int r = Read(buf, nBytes);
-	if (r < 0)
+	if (r <= 0)
 	{
-		return r;
+		return -1;
 	}
 
 	int i = 0;
@@ -354,7 +356,10 @@ int FileStore::ReadLine(char* buf, size_t nBytes)
 FRESULT FileStore::Store(const char *s, size_t len, size_t *bytesWritten)
 {
 	uint32_t time = StepTimer::GetInterruptClocks();
-	crc.Update(s, len);
+	if (calcCrc)
+	{
+		crc.Update(s, len);
+	}
 	const FRESULT writeStatus = f_write(&file, s, len, bytesWritten);
 	time = StepTimer::GetInterruptClocks() - time;
 	if (time > longestWriteTime)

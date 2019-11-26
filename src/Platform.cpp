@@ -35,9 +35,9 @@
 #include "SoftTimer.h"
 #include "Logger.h"
 #include "Tasks.h"
-#include "DmacManager.h"
+#include "Hardware/DmacManager.h"
 #include "Math/Isqrt.h"
-#include "Wire.h"
+#include "Hardware/I2C.h"
 
 #ifndef __LPC17xx__
 # include "sam/drivers/tc/tc.h"
@@ -166,13 +166,13 @@ extern "C" void UrgentInit()
 
 uint8_t Platform::softwareResetDebugInfo = 0;			// extra info for debugging
 
-Platform::Platform() :
-		logger(nullptr), board(DEFAULT_BOARD_TYPE), active(false), errorCodeBits(0),
+Platform::Platform()
+	: logger(nullptr), board(DEFAULT_BOARD_TYPE), active(false), errorCodeBits(0),
 #if HAS_SMART_DRIVERS
-		nextDriveToPoll(0),
+	  nextDriveToPoll(0),
 #endif
-		lastFanCheckTime(0), auxGCodeReply(nullptr), sysDir(nullptr), tickState(0), debugCode(0),
-		lastWarningMillis(0), deliberateError(false), i2cInitialised(false)
+	  lastFanCheckTime(0), auxGCodeReply(nullptr), sysDir(nullptr), tickState(0), debugCode(0),
+	  lastWarningMillis(0), deliberateError(false)
 {
 	massStorage = new MassStorage(this);
 }
@@ -292,7 +292,7 @@ void Platform::Init()
 	ARRAY_INIT(defaultMacAddress, DefaultMacAddress);
 
 	// Motor current setting on Duet 0.6 and 0.8.5
-	InitI2c();
+	I2C::Init();
 	mcpExpansion.setMCP4461Address(0x2E);		// not required for mcpDuet, as this uses the default address
 	ARRAY_INIT(potWipes, POT_WIPES);
 	senseResistor = SENSE_RESISTOR;
@@ -384,14 +384,15 @@ void Platform::Init()
 
 	for (size_t drive = 0; drive < MaxTotalDrivers; drive++)
 	{
-		enableValues[drive] = 0;					// assume active low enable signal
-		directions[drive] = true;					// drive moves forwards by default
+		enableValues[drive] = 0;									// assume active low enable signal
+		directions[drive] = true;									// drive moves forwards by default
 		motorCurrents[drive] = 0.0;
 		motorCurrentFraction[drive] = 1.0;
 		driverState[drive] = DriverStatus::disabled;
+		driveDriverBits[drive + MaxTotalDrivers] = CalcDriverBitmap(drive);
 
 		// Map axes and extruders straight through
-		driveDriverBits[drive] = driveDriverBits[drive + MaxTotalDrivers] = CalcDriverBitmap(drive);	// this returns 0 for remote drivers
+		driveDriverBits[drive] = CalcDriverBitmap(drive);			// this returns 0 for remote drivers
 		if (drive < MaxAxes)
 		{
 			axisDrivers[drive].numDrivers = 1;
@@ -455,7 +456,7 @@ void Platform::Init()
 	delay(200);
 	expansionBoard = DuetExpansion::DueXnInit();
 
-#if HAS_SMART_DRIVERS
+# if HAS_SMART_DRIVERS
 	switch (expansionBoard)
 	{
 	case ExpansionBoardType::DueX2:
@@ -470,7 +471,7 @@ void Platform::Init()
 		numSmartDrivers = 5;									// assume that any additional drivers are dumb enable/step/dir ones
 		break;
 	}
-#endif
+# endif
 
 	if (expansionBoard != ExpansionBoardType::none)
 	{
@@ -639,6 +640,9 @@ void Platform::Init()
 	// Kick everything off
 	InitialiseInterrupts();
 
+#ifdef DUET_NG
+	DuetExpansion::DueXnTaskInit();								// must initialise interrupt priorities before calling this
+#endif
 	active = true;
 }
 
@@ -1259,8 +1263,7 @@ bool Platform::FlushAuxMessages()
 
 		if (auxOutputBuffer->BytesLeft() == 0)
 		{
-			auxOutputBuffer = OutputBuffer::Release(auxOutputBuffer);
-			auxOutput.SetFirstItem(auxOutputBuffer);
+			auxOutput.ReleaseFirstItem();
 		}
 	}
 	return auxOutput.GetFirstItem() != nullptr;
@@ -1282,7 +1285,7 @@ bool Platform::FlushMessages()
 		OutputBuffer *aux2OutputBuffer = aux2Output.GetFirstItem();
 		if (aux2OutputBuffer != nullptr)
 		{
-			size_t bytesToWrite = min<size_t>(SERIAL_AUX2_DEVICE.canWrite(), aux2OutputBuffer->BytesLeft());
+			const size_t bytesToWrite = min<size_t>(SERIAL_AUX2_DEVICE.canWrite(), aux2OutputBuffer->BytesLeft());
 			if (bytesToWrite > 0)
 			{
 				SERIAL_AUX2_DEVICE.write(aux2OutputBuffer->Read(bytesToWrite), bytesToWrite);
@@ -1290,8 +1293,7 @@ bool Platform::FlushMessages()
 
 			if (aux2OutputBuffer->BytesLeft() == 0)
 			{
-				aux2OutputBuffer = OutputBuffer::Release(aux2OutputBuffer);
-				aux2Output.SetFirstItem(aux2OutputBuffer);
+				aux2Output.ReleaseFirstItem();
 			}
 		}
 		aux2HasMore = (aux2Output.GetFirstItem() != nullptr);
@@ -1299,7 +1301,8 @@ bool Platform::FlushMessages()
 #endif
 
 	// Write non-blocking data to the USB line
-	bool usbHasMore;
+	bool usbHasMore = !usbOutput.IsEmpty();				// test first to see if we can avoid getting the mutex
+	if (usbHasMore)
 	{
 		MutexLocker lock(usbMutex);
 		OutputBuffer *usbOutputBuffer = usbOutput.GetFirstItem();
@@ -1314,20 +1317,23 @@ bool Platform::FlushMessages()
 			else
 			{
 				// Write as much data as we can...
-				size_t bytesToWrite = min<size_t>(SERIAL_MAIN_DEVICE.canWrite(), usbOutputBuffer->BytesLeft());
+				const size_t bytesToWrite = min<size_t>(SERIAL_MAIN_DEVICE.canWrite(), usbOutputBuffer->BytesLeft());
 				if (bytesToWrite > 0)
 				{
 					SERIAL_MAIN_DEVICE.write(usbOutputBuffer->Read(bytesToWrite), bytesToWrite);
 				}
 
-				if (usbOutputBuffer->BytesLeft() == 0 || usbOutputBuffer->GetAge() > SERIAL_MAIN_TIMEOUT)
+				if (usbOutputBuffer->BytesLeft() == 0)
 				{
-					usbOutputBuffer = OutputBuffer::Release(usbOutputBuffer);
-					usbOutput.SetFirstItem(usbOutputBuffer);
+					usbOutput.ReleaseFirstItem();
+				}
+				else
+				{
+					usbOutput.ApplyTimeout(SERIAL_MAIN_TIMEOUT);
 				}
 			}
 		}
-		usbHasMore = (usbOutput.GetFirstItem() != nullptr);
+		usbHasMore = !usbOutput.IsEmpty();
 	}
 
 	return auxHasMore
@@ -1431,7 +1437,7 @@ void Platform::Spin()
 
 				// The driver often produces a transient open-load error, especially in stealthchop mode, so we require the condition to persist before we report it.
 				// Also, false open load indications persist when in standstill, if the phase has zero current in that position
-				if ((stat & TMC_RR_OLA) != 0 && motorCurrents[nextDriveToPoll] * motorCurrentFraction[nextDriveToPoll] >= MinimumOpenLoadMotorCurrent)
+				if ((stat & TMC_RR_OLA) != 0)
 				{
 					if (!openLoadATimer.IsRunning())
 					{
@@ -1449,7 +1455,7 @@ void Platform::Spin()
 					}
 				}
 
-				if ((stat & TMC_RR_OLB) != 0 && motorCurrents[nextDriveToPoll] * motorCurrentFraction[nextDriveToPoll] >= MinimumOpenLoadMotorCurrent)
+				if ((stat & TMC_RR_OLB) != 0)
 				{
 					if (!openLoadBTimer.IsRunning())
 					{
@@ -1657,7 +1663,7 @@ void Platform::Spin()
 			// Check for attempts to move motors when not powered
 			if (warnDriversNotPowered)
 			{
-				Message(ErrorMessage, "Attempt to move motors when VIN is not in range");
+				Message(ErrorMessage, "Attempt to move motors when VIN is not in range\n");
 				warnDriversNotPowered = false;
 				reported = true;
 			}
@@ -2274,7 +2280,7 @@ void Platform::Diagnostics(MessageType mtype)
 	}
 
 	// Show the current error codes
-	MessageF(mtype, "Error status: %" PRIu32 "\n", errorCodeBits);
+	MessageF(mtype, "Error status: %" PRIx32 "\n", errorCodeBits);
 
 	// Show the number of free entries in the file table
 	MessageF(mtype, "Free file entries: %u\n", massStorage->GetNumFreeFiles());
@@ -2356,8 +2362,8 @@ void Platform::Diagnostics(MessageType mtype)
 
 #ifdef I2C_IFACE
 	const TwoWire::ErrorCounts errs = I2C_IFACE.GetErrorCounts(true);
-	MessageF(mtype, "I2C nak errors %" PRIu32 ", send timeouts %" PRIu32 ", receive timeouts %" PRIu32 ", finishTimeouts %" PRIu32 "\n",
-		errs.naks, errs.sendTimeouts, errs.recvTimeouts, errs.finishTimeouts);
+	MessageF(mtype, "I2C nak errors %" PRIu32 ", send timeouts %" PRIu32 ", receive timeouts %" PRIu32 ", finishTimeouts %" PRIu32 ", resets %" PRIu32 "\n",
+		errs.naks, errs.sendTimeouts, errs.recvTimeouts, errs.finishTimeouts, errs.resets);
 #endif
 }
 
@@ -2621,11 +2627,11 @@ GCodeResult Platform::DiagnosticTest(GCodeBuffer& gb, const StringRef& reply, in
 
 	case (int)DiagnosticTestType::PrintObjectSizes:
 		reply.printf(
-				"DDA %u, DM %u, Tool %u"
+				"DDA %u, DM %u, Tool %u, GCodeBuffer %u, heater %u"
 #if HAS_NETWORKING && !HAS_LEGACY_NETWORKING
 				", HTTP resp %u, FTP resp %u, Telnet resp %u"
 #endif
-				, sizeof(DDA), sizeof(DriveMovement), sizeof(Tool)
+				, sizeof(DDA), sizeof(DriveMovement), sizeof(Tool), sizeof(GCodeBuffer), sizeof(PID)
 #if HAS_NETWORKING && !HAS_LEGACY_NETWORKING
 				, sizeof(HttpResponder), sizeof(FtpResponder), sizeof(TelnetResponder)
 #endif
@@ -4213,41 +4219,39 @@ const char* Platform::InternalGetSysDir() const
 FileStore* Platform::OpenFile(const char* folder, const char* fileName, OpenMode mode, uint32_t preAllocSize) const
 {
 	String<MaxFilenameLength> location;
-	MassStorage::CombineName(location.GetRef(), folder, fileName);
-	return massStorage->OpenFile(location.c_str(), mode, preAllocSize);
+	return (MassStorage::CombineName(location.GetRef(), folder, fileName))
+			? massStorage->OpenFile(location.c_str(), mode, preAllocSize)
+				: nullptr;
 }
 
 bool Platform::Delete(const char* folder, const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	MassStorage::CombineName(location.GetRef(), folder, filename);
-	return massStorage->Delete(location.c_str());
+	return MassStorage::CombineName(location.GetRef(), folder, filename) && massStorage->Delete(location.c_str());
 }
 
 bool Platform::FileExists(const char* folder, const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	MassStorage::CombineName(location.GetRef(), folder, filename);
-	return massStorage->FileExists(location.c_str());
+	return MassStorage::CombineName(location.GetRef(), folder, filename) && massStorage->FileExists(location.c_str());
 }
 
 bool Platform::DirectoryExists(const char *folder, const char *dir) const
 {
 	String<MaxFilenameLength> location;
-	MassStorage::CombineName(location.GetRef(), folder, dir);
-	return massStorage->DirectoryExists(location.c_str());
+	return MassStorage::CombineName(location.GetRef(), folder, dir) && massStorage->DirectoryExists(location.c_str());
 }
 
 // Set the system files path
-void Platform::SetSysDir(const char* dir)
+GCodeResult Platform::SetSysDir(const char* dir, const StringRef& reply)
 {
 	String<MaxFilenameLength> newSysDir;
 	MutexLocker lock(Tasks::GetSysDirMutex());
 
-	massStorage->CombineName(newSysDir.GetRef(), InternalGetSysDir(), dir);
-	if (!newSysDir.EndsWith('/'))
+	if (!MassStorage::CombineName(newSysDir.GetRef(), InternalGetSysDir(), dir) || (!newSysDir.EndsWith('/') && newSysDir.cat('/')))
 	{
-		newSysDir.cat('/');
+		reply.copy("Path name too long");
+		return GCodeResult::error;
 	}
 
 	const size_t len = newSysDir.strlen() + 1;
@@ -4256,33 +4260,33 @@ void Platform::SetSysDir(const char* dir)
 	const char *nsd2 = nsd;
 	std::swap(sysDir, nsd2);
 	delete nsd2;
+	return GCodeResult::ok;
 }
 
 bool Platform::SysFileExists(const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	MakeSysFileName(location.GetRef(), filename);
-	return massStorage->FileExists(location.c_str());
+	return MakeSysFileName(location.GetRef(), filename) && massStorage->FileExists(location.c_str());
 }
 
 FileStore* Platform::OpenSysFile(const char *filename, OpenMode mode) const
 {
 	String<MaxFilenameLength> location;
-	MakeSysFileName(location.GetRef(), filename);
-	return massStorage->OpenFile(location.c_str(), mode, 0);
+	return (MakeSysFileName(location.GetRef(), filename))
+			? massStorage->OpenFile(location.c_str(), mode, 0)
+				: nullptr;
 }
 
 bool Platform::DeleteSysFile(const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	MakeSysFileName(location.GetRef(), filename);
-	return massStorage->Delete(location.c_str());
+	return MakeSysFileName(location.GetRef(), filename) && massStorage->Delete(location.c_str());
 }
 
-void Platform::MakeSysFileName(const StringRef& result, const char *filename) const
+bool Platform::MakeSysFileName(const StringRef& result, const char *filename) const
 {
 	MutexLocker lock(Tasks::GetSysDirMutex());
-	MassStorage::CombineName(result, InternalGetSysDir(), filename);
+	return MassStorage::CombineName(result, InternalGetSysDir(), filename);
 }
 
 void Platform::GetSysDir(const StringRef & path) const
@@ -4780,22 +4784,6 @@ bool Platform::SetDateTime(time_t time)
 		timeLastUpdatedMillis = millis();
 	}
 	return ok;
-}
-
-// Initialise the I2C interface, if not already done
-void Platform::InitI2c()
-{
-#if defined(I2C_IFACE)
-	if (!i2cInitialised)
-	{
-		MutexLocker lock(Tasks::GetI2CMutex());
-		if (!i2cInitialised)			// test it again, now that we own the mutex
-		{
-			I2C_IFACE.BeginMaster(I2cClockFreq);
-			i2cInitialised = true;
-		}
-	}
-#endif
 }
 
 #if SAM4E || SAM4S || SAME70

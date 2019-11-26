@@ -166,24 +166,38 @@ void Tool::Print(const StringRef& reply) const
 		reply.catf("name: %s; ", name);
 	}
 
-	reply.cat("drives:");
-	char sep = ' ';
-	for (size_t drive = 0; drive < driveCount; drive++)
+	if (driveCount == 0)
 	{
-		reply.catf("%c%d", sep, drives[drive]);
-		sep = ',';
+		reply.cat("no drives");
+	}
+	else
+	{
+		reply.cat("drives:");
+		char sep = ' ';
+		for (size_t drive = 0; drive < driveCount; drive++)
+		{
+			reply.catf("%c%d", sep, drives[drive]);
+			sep = ',';
+		}
 	}
 
-	reply.cat("; heaters (active/standby temps):");
-	sep = ' ';
-	for (size_t heater = 0; heater < heaterCount; heater++)
+	if (heaterCount == 0)
 	{
-		reply.catf("%c%d (%.1f/%.1f)", sep, heaters[heater], (double)activeTemperatures[heater], (double)standbyTemperatures[heater]);
-		sep = ',';
+		reply.cat("; no heaters");
+	}
+	else
+	{
+		reply.cat("; heaters (active/standby temps):");
+		char sep = ' ';
+		for (size_t heater = 0; heater < heaterCount; heater++)
+		{
+			reply.catf("%c%d (%.1f/%.1f)", sep, heaters[heater], (double)activeTemperatures[heater], (double)standbyTemperatures[heater]);
+			sep = ',';
+		}
 	}
 
 	reply.cat("; xmap:");
-	sep = ' ';
+	char sep = ' ';
 	for (size_t xi = 0; xi < MaxAxes; ++xi)
 	{
 		if ((xMapping & (1u << xi)) != 0)
@@ -370,14 +384,13 @@ void Tool::DefineMix(const float m[])
 	}
 }
 
-// Write the tool's settings to file returning true if successful
+// Write the tool's settings to file returning true if successful. The settings written leave the tool selected unless it is off.
 bool Tool::WriteSettings(FileStore *f) const
 {
-	char bufSpace[50];
-	StringRef buf(bufSpace, ARRAY_SIZE(bufSpace));
+	String<StringLength40> buf;
+	bool ok = true;
 
 	// Set up active and standby heater temperatures
-	bool ok = true;
 	if (heaterCount != 0)
 	{
 		buf.printf("G10 P%d ", myNumber);
@@ -400,9 +413,7 @@ bool Tool::WriteSettings(FileStore *f) const
 
 	if (ok && state != ToolState::off)
 	{
-		// Select tool
-		buf.printf("T%d P0\n", myNumber);
-		ok = f->Write(buf.c_str());
+		ok = buf.printf("T%d P0\n", myNumber);
 	}
 
 	return ok;

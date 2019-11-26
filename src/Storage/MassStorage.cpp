@@ -142,49 +142,40 @@ void MassStorage::CloseAllFiles()
 	}
 }
 
-/*static*/ void MassStorage::CombineName(const StringRef& outbuf, const char* directory, const char* fileName)
+// Construct a full path name from a path and a filename. Returns false if error i.e. filename too long
+/*static*/ bool MassStorage::CombineName(const StringRef& outbuf, const char* directory, const char* fileName)
 {
-	outbuf.Clear();
-	size_t outIndex = 0;
-	size_t inIndex = 0;
-
-	// DC 2015-11-25 Only prepend the directory if the filename does not have an absolute path or volume specifier
-	if (directory != nullptr && fileName[0] != '/' && (strlen(fileName) < 2 || !isdigit(fileName[0]) || fileName[1] != ':'))
+	bool hadError = false;
+	if (directory != nullptr && directory[0] != 0 && fileName[0] != '/' && (strlen(fileName) < 2 || !isdigit(fileName[0]) || fileName[1] != ':'))
 	{
-		while (directory[inIndex] != 0 && directory[inIndex] != '\n')
+		hadError = outbuf.copy(directory);
+		if (!hadError)
 		{
-			outbuf.Pointer()[outIndex] = directory[inIndex];
-			inIndex++;
-			outIndex++;
-			if (outIndex >= outbuf.Capacity())
+			const size_t len = outbuf.strlen();
+			if (len != 0 && outbuf[len - 1] != '/')
 			{
-				reprap.GetPlatform().MessageF(ErrorMessage, "CombineName() buffer overflow");
-				outbuf.copy("?????");
-				return;
+				hadError = outbuf.cat('/');
 			}
 		}
-
-		if (inIndex > 0 && directory[inIndex - 1] != '/')
-		{
-			outbuf.Pointer()[outIndex] = '/';
-			outIndex++;
-		}
-		inIndex = 0;
 	}
-
-	while (fileName[inIndex] != 0 && fileName[inIndex] != '\n')
+	else
 	{
-		if (outIndex >= outbuf.Capacity())
-		{
-			reprap.GetPlatform().Message(ErrorMessage, "file name too long");
-			outbuf.copy("?????");
-			return;
-		}
-		outbuf.Pointer()[outIndex] = fileName[inIndex];
-		inIndex++;
-		outIndex++;
+		outbuf.Clear();
 	}
-	outbuf.Pointer()[outIndex] = 0;
+	if (!hadError)
+	{
+		hadError = outbuf.cat(fileName);
+	}
+	if (hadError)
+	{
+		reprap.GetPlatform().MessageF(ErrorMessage, "Filename too long: cap=%u, dir=%.12s%s name=%.12s%s\n",
+										outbuf.Capacity(),
+										directory, (strlen(directory) > 12 ? "..." : ""),
+										fileName, (strlen(fileName) > 12 ? "..." : "")
+									 );
+		outbuf.copy("?????");
+	}
+	return !hadError;
 }
 
 // Open a directory to read a file list. Returns true if it contains any files, false otherwise.
@@ -328,7 +319,10 @@ bool MassStorage::Delete(const char* filePath)
 bool MassStorage::MakeDirectory(const char *parentDir, const char *dirName)
 {
 	String<MaxFilenameLength> location;
-	CombineName(location.GetRef(), parentDir, dirName);
+	if (!CombineName(location.GetRef(), parentDir, dirName))
+	{
+		return false;
+	}
 	if (f_mkdir(location.c_str()) != FR_OK)
 	{
 		reprap.GetPlatform().MessageF(ErrorMessage, "Failed to create directory %s\n", location.c_str());
@@ -487,6 +481,11 @@ GCodeResult MassStorage::Mount(size_t card, const StringRef& reply, bool reportS
 	// Mount the file systems
 	const char path[3] = { (char)('0' + card), ':', 0 };
 	const FRESULT mounted = f_mount(&inf.fileSystem, path, 1);
+	if (mounted == FR_NO_FILESYSTEM)
+	{
+		reply.printf("Cannot mount SD card %u: no FAT filesystem found on card (EXFAT is not supported)", card);
+		return GCodeResult::error;
+	}
 	if (mounted != FR_OK)
 	{
 		reply.printf("Cannot mount SD card %u: code %d", card, mounted);

@@ -197,8 +197,7 @@ private:
 					 usingStandardFeedrate : 1,		// True if this move uses the standard feed rate
 					 isNonPrintingExtruderMove : 1,	// True if this move is a fast extruder-only move, probably a retract/re-prime
 					 continuousRotationShortcut : 1, // True if continuous rotation axes take shortcuts
-					 usesEndstops : 1,				// True if this move monitors endstops of Z probe
-					 controlLaser : 1;				// True if this move controls the laser or iobits
+					 usesEndstops : 1;				// True if this move monitors endstops of Z probe
 		};
 		uint16_t all;								// so that we can print all the flags at once for debugging
 	} flags;
@@ -207,7 +206,7 @@ private:
 	LaserPwmOrIoBits laserPwmOrIoBits;		// laser PWM required or port state required during this move (here because it is currently 16 bits)
 #endif
 
-    EndstopChecks endStopsToCheck;			// Which endstops we are checking on this move
+	EndstopsBitmap endStopsToCheck;			// Which endstops we are checking on this move
     AxesBitmap xAxes;						// Which axes are behaving as X axes
     AxesBitmap yAxes;						// Which axes are behaving as Y axes
 

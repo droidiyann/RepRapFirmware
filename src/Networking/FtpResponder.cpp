@@ -14,8 +14,8 @@
 #include "NetworkInterface.h"
 #include "Platform.h"
 
-FtpResponder::FtpResponder(NetworkResponder *n) : UploadingNetworkResponder(n), dataSocket(nullptr),
-	passivePort(0),	passivePortOpenTime(0), dataBuf(nullptr), haveFileToMove(false)
+FtpResponder::FtpResponder(NetworkResponder *n)
+	: UploadingNetworkResponder(n), dataSocket(nullptr), passivePort(0), passivePortOpenTime(0), dataBuf(nullptr), haveFileToMove(false)
 {
 }
 
@@ -36,6 +36,7 @@ bool FtpResponder::Accept(Socket *s, NetworkProtocol protocol)
 
 			outBuf->copy("220 RepRapFirmware FTP server\r\n");
 			Commit(ResponderState::authenticating);
+			haveCompleteLine = false;
 			return true;
 		}
 	}
@@ -54,9 +55,9 @@ bool FtpResponder::Accept(Socket *s, NetworkProtocol protocol)
 }
 
 // This is called to force termination if we implement the specified protocol
-void FtpResponder::Terminate(NetworkProtocol protocol)
+void FtpResponder::Terminate(NetworkProtocol protocol, NetworkInterface *interface)
 {
-	if (responderState != ResponderState::free && (protocol == FtpProtocol || protocol == AnyProtocol))
+	if (responderState != ResponderState::free && (protocol == FtpProtocol || protocol == AnyProtocol) && skt != nullptr && skt->GetInterface() == interface)
 	{
 		ConnectionLost();
 	}
@@ -359,7 +360,7 @@ void FtpResponder::DoUpload()
 		if (!fileBeingUploaded.Write(buffer, len))
 		{
 			uploadError = true;
-			GetPlatform().Message(ErrorMessage, "Could not write upload data!\n");
+			GetPlatform().Message(ErrorMessage, "FTP: could not write upload data\n");
 			CancelUpload();
 
 			responderState = ResponderState::pasvTransferComplete;
@@ -373,7 +374,7 @@ void FtpResponder::DoUpload()
 		dataSocket = nullptr;
 		responderState = ResponderState::pasvTransferComplete;
 
-		FinishUpload(0, 0);
+		FinishUpload(0, 0, false, 0);
 	}
 }
 
@@ -601,9 +602,8 @@ void FtpResponder::ProcessLine()
 		{
 			const char *filename = GetParameter("MKD");
 			String<MaxFilenameLength> location;
-			MassStorage::CombineName(location.GetRef(), currentDirectory.c_str(), filename);
-
-			if (GetPlatform().GetMassStorage()->MakeDirectory(location.c_str()))
+			if (MassStorage::CombineName(location.GetRef(), currentDirectory.c_str(), filename)
+				&& GetPlatform().GetMassStorage()->MakeDirectory(location.c_str()))
 			{
 				outBuf->printf("257 \"%s\" created\r\n", location.c_str());
 			}
@@ -617,9 +617,8 @@ void FtpResponder::ProcessLine()
 		else if (StringStartsWith(clientMessage, "RNFR"))
 		{
 			const char *filename = GetParameter("RNFR");
-			MassStorage::CombineName(filenameBeingProcessed.GetRef(), currentDirectory.c_str(), filename);
-
-			if (GetPlatform().GetMassStorage()->FileExists(filenameBeingProcessed.c_str()))
+			if (MassStorage::CombineName(filenameBeingProcessed.GetRef(), currentDirectory.c_str(), filename)
+				&& GetPlatform().GetMassStorage()->FileExists(filenameBeingProcessed.c_str()))
 			{
 				haveFileToMove = true;
 				outBuf->copy("350 Ready to RNTO.\r\n");
@@ -634,9 +633,9 @@ void FtpResponder::ProcessLine()
 		{
 			const char *filename = GetParameter("RNTO");
 			String<MaxFilenameLength> location;
-			MassStorage::CombineName(location.GetRef(), currentDirectory.c_str(), filename);
-
-			if (haveFileToMove && GetPlatform().GetMassStorage()->Rename(filenameBeingProcessed.c_str(), location.c_str()))
+			if (haveFileToMove
+				&& MassStorage::CombineName(location.GetRef(), currentDirectory.c_str(), filename)
+				&& GetPlatform().GetMassStorage()->Rename(filenameBeingProcessed.c_str(), location.c_str()))
 			{
 				outBuf->copy("250 Rename successful.\r\n");
 			}
@@ -719,11 +718,9 @@ void FtpResponder::ProcessLine()
 			filenameBeingProcessed.Clear();
 
 			const char * const filename = GetParameter("STOR");
-			FileStore * const file = GetPlatform().OpenFile(currentDirectory.c_str(), filename, OpenMode::write);
+			FileStore * const file = StartUpload(currentDirectory.c_str(), filename, OpenMode::write);
 			if (file != nullptr)
 			{
-				StartUpload(file, filename);
-
 				outBuf->copy("150 OK to send data.\r\n");
 				Commit(ResponderState::uploading);
 			}
@@ -910,6 +907,17 @@ void FtpResponder::CloseDataPort()
 		fileBeingSent->Close();
 		fileBeingSent = nullptr;
 	}
+}
+
+/*static*/ void FtpResponder::InitStatic()
+{
+	// Nothing needed here
+}
+
+// This is called when we are shutting down the network or just this protocol. It may be called even if this protocol isn't enabled.
+/*static*/ void FtpResponder::Disable()
+{
+	// Nothing needed here
 }
 
 #endif
